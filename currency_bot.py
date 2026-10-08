@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import threading
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, F
@@ -8,10 +9,15 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    ChatType,
+)
 import aiohttp
 
-# --- Flask-приложение для Render ---
+# --- Flask для Render ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -23,12 +29,15 @@ def health():
     return "OK"
 
 def run_flask():
-    """Запускает Flask в отдельном потоке, чтобы Render видел веб-сервис."""
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
+
 # --- Токен ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+# Слова-триггеры для запуска бота в группах
+TRIGGER_WORDS = ["валюта", "валюты", "конверт", "конвертер", "convert", "курс", "обмен"]
 
 CURRENCIES = {
     "USD": ("Доллар США", "🇺🇸"),
@@ -120,8 +129,10 @@ def get_result_keyboard(base_currency: str) -> InlineKeyboardMarkup:
     ])
 
 
-@dp.message(Command("start", "help"))
-async def cmd_start(message: types.Message):
+# ============ ЛИЧНЫЕ СООБЩЕНИЯ ============
+
+@dp.message(Command("start", "help"), F.chat.type == ChatType.PRIVATE)
+async def cmd_start_private(message: types.Message):
     await message.answer(
         "👋 Привет! Я бот для конвертации валют.\n\n"
         "📌 **Как пользоваться:**\n"
@@ -129,13 +140,14 @@ async def cmd_start(message: types.Message):
         "2. Выбери исходную валюту\n"
         "3. Введи сумму\n"
         "4. Получи конвертацию во все валюты!\n\n"
+        "💡 Добавь меня в группу — и я буду запускаться по слову `валюта`\n\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         "🤖 Бот был создан @PHARAOH_G6"
     )
 
 
-@dp.message(Command("convert"))
-async def cmd_convert(message: types.Message, state: FSMContext):
+@dp.message(Command("convert"), F.chat.type == ChatType.PRIVATE)
+async def cmd_convert_private(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "💱 **Выберите исходную валюту:**",
@@ -143,6 +155,57 @@ async def cmd_convert(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
+
+# ============ ГРУППЫ ============
+
+@dp.message(Command("start", "help"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def cmd_start_group(message: types.Message):
+    await message.answer(
+        "👋 Привет всем! Я бот для конвертации валют.\n\n"
+        "📌 **Как пользоваться:**\n"
+        "Напишите слово-триггер (например, `валюта` или `конверт`) — "
+        "и я предложу выбрать исходную валюту.\n\n"
+        "Или используйте команду /convert.\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 Бот был создан @PHARAOH_G6"
+    )
+
+
+@dp.message(Command("convert"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def cmd_convert_group(message: types.Message, state: FSMContext):
+    # Сбрасываем состояние только этого пользователя
+    await state.clear()
+    # В группе отвечаем реплаем на сообщение пользователя
+    await message.reply(
+        "💱 **Выберите исходную валюту:**",
+        reply_markup=get_currency_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
+async def group_trigger(message: types.Message, state: FSMContext):
+    """Ловит триггер-слова в группах и запускает конвертацию."""
+    # Игнорируем команды
+    if message.text.startswith("/"):
+        return
+
+    text_lower = message.text.lower()
+    # Проверяем наличие триггер-слова как отдельного слова
+    words = re.findall(r"\b\w+\b", text_lower)
+    if not any(trigger in words for trigger in TRIGGER_WORDS):
+        return
+
+    # Сбрасываем состояние только этого пользователя
+    await state.clear()
+    await message.reply(
+        "💱 **Выберите исходную валюту:**",
+        reply_markup=get_currency_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+# ============ ОБЩИЕ ОБРАБОТЧИКИ (личка + группа) ============
 
 @dp.callback_query(F.data.startswith("curr:"))
 async def process_currency_choice(callback: CallbackQuery, state: FSMContext):
@@ -152,13 +215,14 @@ async def process_currency_choice(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ConvertState.waiting_for_amount)
     await callback.message.edit_text(
         f"✅ Выбрана валюта: {emoji} **{code}** ({name})\n\n"
-        f"💵 Введите сумму для конвертации (например, `100` или `99.5`):",
+        f"💵 {callback.from_user.first_name}, введите сумму для конвертации "
+        f"(например, `100` или `99.5`):",
         parse_mode="Markdown"
     )
     await callback.answer()
 
 
-@dp.message(ConvertState.waiting_for_amount)
+@dp.message(ConvertState.waiting_for_amount, F.text)
 async def process_amount(message: types.Message, state: FSMContext):
     text = message.text.strip().replace(",", ".")
     try:
@@ -166,21 +230,34 @@ async def process_amount(message: types.Message, state: FSMContext):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer(
+        await message.reply(
             "❌ Пожалуйста, введите корректное положительное число.\n"
             "Пример: `100` или `99.5`",
             parse_mode="Markdown"
         )
         return
+
     data = await state.get_data()
     base_currency = data.get("base_currency", "USD")
     await state.clear()
-    status_msg = await message.answer("🔄 Получаю актуальные курсы...")
+
+    # В группе отвечаем реплаем, в личке — обычным сообщением
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        status_msg = await message.reply("🔄 Получаю актуальные курсы...")
+    else:
+        status_msg = await message.answer("🔄 Получаю актуальные курсы...")
+
     try:
         rates = await get_all_rates(base_currency)
         result_text = format_result(amount, base_currency, rates)
+
+        # В группе добавляем упоминание пользователя
+        if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            result_text = f"👤 {message.from_user.first_name}:\n\n" + result_text
+
         keyboard = get_result_keyboard(base_currency)
         await status_msg.edit_text(result_text, parse_mode="Markdown", reply_markup=keyboard)
+
         await state.update_data(last_amount=amount, last_base=base_currency, last_rates=rates)
     except Exception as e:
         await status_msg.edit_text(f"⚠️ Ошибка: {str(e)}")
@@ -194,7 +271,7 @@ async def process_again(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ConvertState.waiting_for_amount)
     await callback.message.edit_text(
         f"✅ Валюта: {emoji} **{base_currency}** ({name})\n\n"
-        f"💵 Введите новую сумму для конвертации:",
+        f"💵 {callback.from_user.first_name}, введите новую сумму:",
         parse_mode="Markdown"
     )
     await callback.answer()
@@ -220,6 +297,7 @@ async def process_copy_menu(callback: CallbackQuery, state: FSMContext):
     if not last_rates or not last_base or last_amount is None:
         await callback.answer("❌ Данные устарели. Сделайте новый расчёт.", show_alert=True)
         return
+
     buttons = []
     row = []
     for code, (name, emoji) in CURRENCIES.items():
@@ -232,9 +310,12 @@ async def process_copy_menu(callback: CallbackQuery, state: FSMContext):
     if row:
         buttons.append(row)
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="copy_back")])
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(
-        f"📋 **Что скопировать?**\n\nИсходно: {last_amount:,.2f} {last_base}\nВыберите валюту — пришлю отдельным сообщением:",
+        f"📋 **Что скопировать?**\n\n"
+        f"Исходно: {last_amount:,.2f} {last_base}\n"
+        f"Выберите валюту — пришлю отдельным сообщением:",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -251,12 +332,22 @@ async def process_copy_value(callback: CallbackQuery, state: FSMContext):
     if not last_rates or code not in last_rates:
         await callback.answer("❌ Данные устарели. Сделайте новый расчёт.", show_alert=True)
         return
+
     value_str = convert_value(last_amount, last_rates[code])
     name, emoji = CURRENCIES.get(code, (code, ""))
-    await callback.message.answer(f"`{value_str}`", parse_mode="Markdown")
+
+    # В группе отвечаем реплаем на сообщение с результатом
+    await callback.message.reply(f"`{value_str}`", parse_mode="Markdown")
     await callback.answer(f"✅ {value_str} {code} отправлено")
+
     result_text = format_result(last_amount, last_base, last_rates)
-    await callback.message.edit_text(result_text, parse_mode="Markdown", reply_markup=get_result_keyboard(last_base))
+    if callback.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        result_text = f"👤 {callback.from_user.first_name}:\n\n" + result_text
+    await callback.message.edit_text(
+        result_text,
+        parse_mode="Markdown",
+        reply_markup=get_result_keyboard(last_base)
+    )
 
 
 @dp.callback_query(F.data == "copy_back")
@@ -268,25 +359,35 @@ async def process_copy_back(callback: CallbackQuery, state: FSMContext):
     if not last_rates or not last_base or last_amount is None:
         await callback.answer("❌ Данные устарели.", show_alert=True)
         return
+
     result_text = format_result(last_amount, last_base, last_rates)
-    await callback.message.edit_text(result_text, parse_mode="Markdown", reply_markup=get_result_keyboard(last_base))
+    if callback.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        result_text = f"👤 {callback.from_user.first_name}:\n\n" + result_text
+    await callback.message.edit_text(
+        result_text,
+        parse_mode="Markdown",
+        reply_markup=get_result_keyboard(last_base)
+    )
     await callback.answer()
 
 
-@dp.message()
-async def fallback(message: types.Message):
+@dp.message(F.chat.type == ChatType.PRIVATE)
+async def fallback_private(message: types.Message):
     await message.answer(
         "🤔 Не понимаю эту команду.\n"
         "Используй /convert, чтобы начать конвертацию."
     )
 
 
+# ============ ЗАПУСК ============
+
 async def main():
     logging.basicConfig(level=logging.INFO)
+    # ВАЖНО: bot должен видеть сообщения в группах
+    # Это делается через BotFather: /setprivacy -> Disable
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    # Запускаем Flask в фоне, чтобы Render не спал
     threading.Thread(target=run_flask, daemon=True).start()
     asyncio.run(main())
