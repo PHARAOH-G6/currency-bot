@@ -13,8 +13,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
-    ChatType,
 )
+from aiogram.enums import ChatType
 import aiohttp
 
 # --- Flask для Render ---
@@ -173,9 +173,7 @@ async def cmd_start_group(message: types.Message):
 
 @dp.message(Command("convert"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_convert_group(message: types.Message, state: FSMContext):
-    # Сбрасываем состояние только этого пользователя
     await state.clear()
-    # В группе отвечаем реплаем на сообщение пользователя
     await message.reply(
         "💱 **Выберите исходную валюту:**",
         reply_markup=get_currency_keyboard(),
@@ -186,17 +184,14 @@ async def cmd_convert_group(message: types.Message, state: FSMContext):
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
 async def group_trigger(message: types.Message, state: FSMContext):
     """Ловит триггер-слова в группах и запускает конвертацию."""
-    # Игнорируем команды
     if message.text.startswith("/"):
         return
 
     text_lower = message.text.lower()
-    # Проверяем наличие триггер-слова как отдельного слова
     words = re.findall(r"\b\w+\b", text_lower)
     if not any(trigger in words for trigger in TRIGGER_WORDS):
         return
 
-    # Сбрасываем состояние только этого пользователя
     await state.clear()
     await message.reply(
         "💱 **Выберите исходную валюту:**",
@@ -241,7 +236,6 @@ async def process_amount(message: types.Message, state: FSMContext):
     base_currency = data.get("base_currency", "USD")
     await state.clear()
 
-    # В группе отвечаем реплаем, в личке — обычным сообщением
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         status_msg = await message.reply("🔄 Получаю актуальные курсы...")
     else:
@@ -251,7 +245,6 @@ async def process_amount(message: types.Message, state: FSMContext):
         rates = await get_all_rates(base_currency)
         result_text = format_result(amount, base_currency, rates)
 
-        # В группе добавляем упоминание пользователя
         if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             result_text = f"👤 {message.from_user.first_name}:\n\n" + result_text
 
@@ -336,7 +329,6 @@ async def process_copy_value(callback: CallbackQuery, state: FSMContext):
     value_str = convert_value(last_amount, last_rates[code])
     name, emoji = CURRENCIES.get(code, (code, ""))
 
-    # В группе отвечаем реплаем на сообщение с результатом
     await callback.message.reply(f"`{value_str}`", parse_mode="Markdown")
     await callback.answer(f"✅ {value_str} {code} отправлено")
 
@@ -383,8 +375,6 @@ async def fallback_private(message: types.Message):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    # ВАЖНО: bot должен видеть сообщения в группах
-    # Это делается через BotFather: /setprivacy -> Disable
     await dp.start_polling(bot)
 
 
