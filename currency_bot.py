@@ -33,10 +33,8 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 
-# --- Токен ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-# Слова-триггеры для запуска бота в группах
 TRIGGER_WORDS = ["валюта", "валюты", "конверт", "конвертер", "convert", "курс", "обмен"]
 
 CURRENCIES = {
@@ -129,7 +127,76 @@ def get_result_keyboard(base_currency: str) -> InlineKeyboardMarkup:
     ])
 
 
-# ============ ЛИЧНЫЕ СООБЩЕНИЯ ============
+# ================================================================
+# ВАЖНО: process_amount идёт ПЕРЕД group_trigger!
+# В aiogram 3 хендлеры проверяются в порядке регистрации.
+# Более специфичный (с фильтром состояния) должен идти раньше.
+# ================================================================
+
+@dp.message(ConvertState.waiting_for_amount, F.text)
+async def process_amount(message: types.Message, state: FSMContext):
+    print(f"[AMOUNT] user={message.from_user.id} chat={message.chat.id} text={message.text!r}")
+
+    text = message.text.strip().replace(",", ".")
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.reply(
+            "❌ Пожалуйста, введите корректное положительное число.\n"
+            "Пример: `100` или `99.5`",
+            parse_mode="Markdown"
+        )
+        return
+
+    data = await state.get_data()
+    base_currency = data.get("base_currency", "USD")
+    await state.clear()
+
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        status_msg = await message.reply("🔄 Получаю актуальные курсы...")
+    else:
+        status_msg = await message.answer("🔄 Получаю актуальные курсы...")
+
+    try:
+        rates = await get_all_rates(base_currency)
+        result_text = format_result(amount, base_currency, rates)
+        if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            result_text = f"👤 {message.from_user.first_name}:\n\n" + result_text
+        keyboard = get_result_keyboard(base_currency)
+        await status_msg.edit_text(result_text, parse_mode="Markdown", reply_markup=keyboard)
+        await state.update_data(last_amount=amount, last_base=base_currency, last_rates=rates)
+    except Exception as e:
+        await status_msg.edit_text(f"⚠️ Ошибка: {str(e)}")
+
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
+async def group_trigger(message: types.Message, state: FSMContext):
+    if message.text.startswith("/"):
+        return
+
+    current_state = await state.get_state()
+    print(f"[GROUP] user={message.from_user.id} chat={message.chat.id} state={current_state} text={message.text!r}")
+
+    # Если пользователь сейчас вводит сумму — пропускаем (не мешаем process_amount)
+    if current_state == ConvertState.waiting_for_amount.state:
+        return
+
+    text_lower = message.text.lower()
+    words = re.findall(r"\b\w+\b", text_lower)
+    if not any(trigger in words for trigger in TRIGGER_WORDS):
+        return
+
+    await state.clear()
+    await message.reply(
+        "💱 **Выберите исходную валюту:**",
+        reply_markup=get_currency_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+# ============ ЛИЧКА ============
 
 @dp.message(Command("start", "help"), F.chat.type == ChatType.PRIVATE)
 async def cmd_start_private(message: types.Message):
@@ -156,7 +223,7 @@ async def cmd_convert_private(message: types.Message, state: FSMContext):
     )
 
 
-# ============ ГРУППЫ ============
+# ============ ГРУППЫ: КОМАНДЫ ============
 
 @dp.message(Command("start", "help"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_start_group(message: types.Message):
@@ -181,26 +248,7 @@ async def cmd_convert_group(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text)
-async def group_trigger(message: types.Message, state: FSMContext):
-    """Ловит триггер-слова в группах и запускает конвертацию."""
-    if message.text.startswith("/"):
-        return
-
-    text_lower = message.text.lower()
-    words = re.findall(r"\b\w+\b", text_lower)
-    if not any(trigger in words for trigger in TRIGGER_WORDS):
-        return
-
-    await state.clear()
-    await message.reply(
-        "💱 **Выберите исходную валюту:**",
-        reply_markup=get_currency_keyboard(),
-        parse_mode="Markdown"
-    )
-
-
-# ============ ОБЩИЕ ОБРАБОТЧИКИ (личка + группа) ============
+# ============ ОБЩИЕ CALLBACK-ХЕНДЛЕРЫ ============
 
 @dp.callback_query(F.data.startswith("curr:"))
 async def process_currency_choice(callback: CallbackQuery, state: FSMContext):
@@ -215,45 +263,6 @@ async def process_currency_choice(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
     await callback.answer()
-
-
-@dp.message(ConvertState.waiting_for_amount, F.text)
-async def process_amount(message: types.Message, state: FSMContext):
-    text = message.text.strip().replace(",", ".")
-    try:
-        amount = float(text)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply(
-            "❌ Пожалуйста, введите корректное положительное число.\n"
-            "Пример: `100` или `99.5`",
-            parse_mode="Markdown"
-        )
-        return
-
-    data = await state.get_data()
-    base_currency = data.get("base_currency", "USD")
-    await state.clear()
-
-    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        status_msg = await message.reply("🔄 Получаю актуальные курсы...")
-    else:
-        status_msg = await message.answer("🔄 Получаю актуальные курсы...")
-
-    try:
-        rates = await get_all_rates(base_currency)
-        result_text = format_result(amount, base_currency, rates)
-
-        if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-            result_text = f"👤 {message.from_user.first_name}:\n\n" + result_text
-
-        keyboard = get_result_keyboard(base_currency)
-        await status_msg.edit_text(result_text, parse_mode="Markdown", reply_markup=keyboard)
-
-        await state.update_data(last_amount=amount, last_base=base_currency, last_rates=rates)
-    except Exception as e:
-        await status_msg.edit_text(f"⚠️ Ошибка: {str(e)}")
 
 
 @dp.callback_query(F.data.startswith("again:"))
